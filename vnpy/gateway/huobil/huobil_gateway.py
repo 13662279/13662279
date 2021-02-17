@@ -1,26 +1,21 @@
-"""
-火币正向永续合约接口
-"""
-
+import re
+import urllib
 import base64
+import json
+import zlib
 import hashlib
 import hmac
-import json
-import re
 import sys
-import urllib
-import zlib
 from copy import copy
 from datetime import datetime, timedelta
 from threading import Lock
-from typing import Dict, List, Any
-from typing import Sequence
-
 import pytz
+from typing import Dict, List, Any, Sequence
+from time import sleep
 
+from vnpy.event import Event
 from vnpy.api.rest import RestClient, Request
 from vnpy.api.websocket import WebsocketClient
-from vnpy.event import Event
 from vnpy.trader.constant import (
     Direction,
     Offset,
@@ -30,7 +25,6 @@ from vnpy.trader.constant import (
     OrderType,
     Interval
 )
-from vnpy.trader.event import EVENT_TIMER
 from vnpy.trader.gateway import BaseGateway
 from vnpy.trader.object import (
     TickData,
@@ -45,6 +39,12 @@ from vnpy.trader.object import (
     SubscribeRequest,
     HistoryRequest
 )
+from vnpy.trader.event import EVENT_TIMER
+
+
+REST_HOST = "https://api.hbdm.com"
+WEBSOCKET_DATA_HOST = "wss://api.hbdm.com/swap-ws"               # Market Data
+WEBSOCKET_TRADE_HOST = "wss://api.hbdm.com/swap-notification"    # Account and Order
 
 STATUS_HUOBIS2VT: Dict[int, Status] = {
     3: Status.NOTTRADED,
@@ -55,7 +55,7 @@ STATUS_HUOBIS2VT: Dict[int, Status] = {
 }
 
 ORDERTYPE_VT2HUOBIS: Dict[OrderType, Any] = {
-    OrderType.MARKET: "optimal_20",
+    OrderType.MARKET: "opponent",
     OrderType.LIMIT: "limit",
     OrderType.FOK: "fok",
     OrderType.FAK: "ioc"
@@ -100,20 +100,15 @@ CHINA_TZ = pytz.timezone("Asia/Shanghai")
 
 class HuobilGateway(BaseGateway):
     """
-    VN Trader Gateway for Huobis connection.
+    VN Trader Gateway for Huobiu connection.
     """
 
     default_setting: Dict[str, Any] = {
-        "Rest API 地址": "https://api.hbdm.com",
-        "Data WS 地址": "wss://www.hbdm.com/linear-swap-ws",
-        "Trade WS 地址": "wss://api.hbdm.com/linear-swap-notification",
         "API Key": "",
         "Secret Key": "",
         "会话数": 3,
         "代理地址": "",
         "代理端口": "",
-        "保证金模式": "cross",
-        "杠杆倍数": 20
     }
 
     exchanges = [Exchange.HUOBI]
@@ -128,28 +123,21 @@ class HuobilGateway(BaseGateway):
 
     def connect(self, setting: dict) -> None:
         """"""
-        rest_url = setting["Rest API 地址"]
-        market_ws_url = setting["Data WS 地址"]
-        trade_ws_url = setting["Trade WS 地址"]
-
         key = setting["API Key"]
         secret = setting["Secret Key"]
         session_number = setting["会话数"]
         proxy_host = setting["代理地址"]
         proxy_port = setting["代理端口"]
-        margin_mode = setting["保证金模式"]
-        leverage_ratio = setting["杠杆倍数"]
 
         if proxy_port.isdigit():
             proxy_port = int(proxy_port)
         else:
             proxy_port = 0
 
-        self.rest_api.connect(rest_url, key, secret, session_number, proxy_host, proxy_port,
-                              margin_mode, leverage_ratio)
-
-        self.trade_ws_api.connect(trade_ws_url, key, secret, proxy_host, proxy_port, margin_mode)
-        self.market_ws_api.connect(market_ws_url, key, secret, proxy_host, proxy_port)
+        self.rest_api.connect(key, secret, session_number,
+                              proxy_host, proxy_port)
+        self.trade_ws_api.connect(key, secret, proxy_host, proxy_port)
+        self.market_ws_api.connect(key, secret, proxy_host, proxy_port)
 
         self.init_query()
 
@@ -161,7 +149,7 @@ class HuobilGateway(BaseGateway):
         """"""
         return self.rest_api.send_order(req)
 
-    def cancel_order(self, req: CancelRequest) -> Request:
+    def cancel_order(self, req: CancelRequest) -> None:
         """"""
         self.rest_api.cancel_order(req)
 
@@ -169,11 +157,11 @@ class HuobilGateway(BaseGateway):
         """"""
         return self.rest_api.send_orders(reqs)
 
-    def query_account(self) -> Request:
+    def query_account(self) -> None:
         """"""
         self.rest_api.query_account()
 
-    def query_position(self) -> Request:
+    def query_position(self) -> None:
         """"""
         self.rest_api.query_position()
 
@@ -218,7 +206,6 @@ class HuobilRestApi(RestClient):
         self.key: str = ""
         self.secret: str = ""
         self.account_id: str = ""
-        self.margin_mode = "cross"
 
         self.order_count: int = 10000
         self.order_count_lock: Lock = Lock()
@@ -253,81 +240,57 @@ class HuobilRestApi(RestClient):
         return request
 
     def connect(
-            self,
-            url: str,
-            key: str,
-            secret: str,
-            session_number: int,
-            proxy_host: str,
-            proxy_port: int,
-            margin_mode: str,
-            leverage_ratio: int
+        self,
+        key: str,
+        secret: str,
+        session_number: int,
+        proxy_host: str,
+        proxy_port: int
     ) -> None:
         """
         Initialize connection to REST server.
         """
         self.key = key
         self.secret = secret
-        self.host, _ = _split_url(url)
+        self.host, _ = _split_url(REST_HOST)
         self.connect_time = int(datetime.now(CHINA_TZ).strftime("%y%m%d%H%M%S"))
-        self.margin_mode = margin_mode
-        self.leverage_ratio = leverage_ratio
 
-        self.init(url, proxy_host, proxy_port)
+        self.init(REST_HOST, proxy_host, proxy_port)
         self.start(session_number)
 
         self.gateway.write_log("REST API启动成功")
 
         self.query_contract()
 
-    def query_account(self) -> Request:
+    def query_account(self) -> None:
         """"""
-        if self.margin_mode == "cross":
-            self.add_request(
-                method="POST",
-                path="/linear-swap-api/v1/swap_cross_account_info",
-                callback=self.on_query_account
-            )
-        else:
-            self.add_request(
-                method="POST",
-                path="/linear-swap-api/v1/swap_account_info",
-                callback=self.on_query_account
-            )
-
-    def query_position(self) -> Request:
-        """"""
-        if self.margin_mode == "cross":
-            path = "/linear-swap-api/v1/swap_cross_position_info"
-        else:
-            path = "/linear-swap-api/v1/swap_position_info"
-
         self.add_request(
             method="POST",
-            path=path,
+            path="/linear-swap-api/v1/swap_cross_account_info",
+            callback=self.on_query_account
+        )
+
+    def query_position(self) -> None:
+        """"""
+        self.add_request(
+            method="POST",
+            path="/linear-swap-api/v1/swap_cross_position_info",
             callback=self.on_query_position
         )
 
-    def query_order(self) -> Request:
+    def query_order(self, contract_code: str) -> None:
         """"""
-        if self.margin_mode == "cross":
-            path = "/linear-swap-api/v1/swap_cross_openorders"
-        else:
-            path = "/linear-swap-api/v1/swap_openorders"
+        data = {"contract_code": contract_code}
 
-        for contract_code in self.contract_codes:
-            # Open Orders
-            data = {"contract_code": contract_code}
+        self.add_request(
+            method="POST",
+            path="/linear-swap-api/v1/swap_cross_openorders",
+            callback=self.on_query_order,
+            data=data,
+            extra=contract_code
+        )
 
-            self.add_request(
-                method="POST",
-                path=path,
-                callback=self.on_query_order,
-                data=data,
-                extra=contract_code
-            )
-
-    def query_contract(self) -> Request:
+    def query_contract(self) -> None:
         """"""
         self.add_request(
             method="GET",
@@ -374,11 +337,6 @@ class HuobilRestApi(RestClient):
                 break
             else:
                 data = resp.json()
-                if data["status"] != "ok":
-                    msg = f"获取历史数据失败，状态码：{data['err-code']}，信息：{data['err-msg']}"
-                    self.gateway.write_log(msg)
-                    break
-
                 if not data:
                     msg = f"获取历史数据为空"
                     self.gateway.write_log(msg)
@@ -447,17 +405,12 @@ class HuobilRestApi(RestClient):
             "direction": DIRECTION_VT2HUOBIS.get(req.direction, ""),
             "offset": OFFSET_VT2HUOBIS.get(req.offset, ""),
             "order_price_type": ORDERTYPE_VT2HUOBIS.get(req.type, ""),
-            "lever_rate": self.leverage_ratio
+            "lever_rate": 20
         }
-
-        if self.margin_mode == "cross":
-            path = "/linear-swap-api/v1/swap_cross_order"
-        else:
-            path = "/linear-swap-api/v1/swap_order"
 
         self.add_request(
             method="POST",
-            path=path,
+            path="/linear-swap-api/v1/swap_cross_order",
             callback=self.on_send_order,
             data=data,
             extra=order,
@@ -503,14 +456,9 @@ class HuobilRestApi(RestClient):
             "orders_data": orders_data
         }
 
-        if self.margin_mode == "cross":
-            path = "/linear-swap-api/v1/swap_cross_batchorder"
-        else:
-            path = "/linear-swap-api/v1/swap_batchorder"
-
         self.add_request(
             method="POST",
-            path=path,
+            path="/linear-swap-api/v1/swap_cross_batchorder",
             callback=self.on_send_orders,
             data=data,
             extra=orders,
@@ -520,7 +468,7 @@ class HuobilRestApi(RestClient):
 
         return vt_orderids
 
-    def cancel_order(self, req: CancelRequest) -> Request:
+    def cancel_order(self, req: CancelRequest) -> None:
         """"""
         buf = [i for i in req.symbol if not i.isdigit()]
 
@@ -534,14 +482,9 @@ class HuobilRestApi(RestClient):
         else:
             data["order_id"] = orderid
 
-        if self.margin_mode == "cross":
-            path = "/linear-swap-api/v1/swap_cross_cancel"
-        else:
-            path = "/linear-swap-api/v1/swap_cancel"
-
         self.add_request(
             method="POST",
-            path=path,
+            path="/linear-swap-api/v1/swap_cross_cancel",
             callback=self.on_cancel_order,
             on_failed=self.on_cancel_order_failed,
             data=data,
@@ -554,15 +497,14 @@ class HuobilRestApi(RestClient):
             return
 
         for d in data["data"]:
-            if d["margin_mode"] == self.margin_mode:
-                account = AccountData(
-                    accountid=d["margin_asset"],
-                    balance=d["margin_balance"],
-                    frozen=d["margin_frozen"],
-                    gateway_name=self.gateway_name,
-                )
+            account = AccountData(
+                accountid=d["margin_account"],
+                balance=d["margin_balance"],
+                frozen=d["margin_frozen"],
+                gateway_name=self.gateway_name,
+            )
 
-                self.gateway.on_account(account)
+            self.gateway.on_account(account)
 
     def on_query_position(self, data: dict, request: Request) -> None:
         """"""
@@ -629,6 +571,11 @@ class HuobilRestApi(RestClient):
 
         self.gateway.write_log(f"{request.extra}活动委托信息查询成功")
 
+        if self.order_codes:
+            sleep(0.1)
+            contract_code = self.order_codes.pop()
+            self.query_order(contract_code)
+
     def on_query_contract(self, data: dict, request: Request) -> None:
         """"""
         if self.check_error(data, "查询合约"):
@@ -652,7 +599,10 @@ class HuobilRestApi(RestClient):
 
         self.gateway.write_log("合约信息查询成功")
 
-        self.query_order()
+        # Start querying open order info
+        self.order_codes = copy(self.contract_codes)
+        contract_code = self.order_codes.pop()
+        self.query_order(contract_code)
 
     def on_send_order(self, data: dict, request: Request) -> None:
         """"""
@@ -807,28 +757,22 @@ class HuobilWebsocketApiBase(WebsocketClient):
         self.req_id: int = 0
 
     def connect(
-            self,
-            url: str,
-            key: str,
-            secret: str,
-            proxy_host: str,
-            proxy_port: int
+        self,
+        key: str,
+        secret: str,
+        url: str,
+        proxy_host: str,
+        proxy_port: int
     ) -> None:
         """"""
-        self.url = url
         self.key = key
         self.secret = secret
-        self.proxy_host = proxy_host
-        self.proxy_port = proxy_port
 
         host, path = _split_url(url)
         self.sign_host = host
         self.path = path
 
         self.init(url, proxy_host, proxy_port)
-        self.start()
-
-    def on_disconnected(self):
         self.start()
 
     def login(self) -> int:
@@ -874,13 +818,13 @@ class HuobilWebsocketApiBase(WebsocketClient):
         elif "err-msg" in packet:
             return self.on_error_msg(packet)
         elif "op" in packet and packet["op"] == "auth":
-            return self.on_login(packet)
+            return self.on_login()
         else:
             self.on_data(packet)
 
     def on_data(self, packet) -> None:
         """"""
-        pass
+        print("data : {}".format(packet))
 
     def on_error_msg(self, packet) -> None:
         """"""
@@ -899,21 +843,17 @@ class HuobilTradeWebsocketApi(HuobilWebsocketApiBase):
         super().__init__(gateway)
 
     def connect(
-            self,
-            url: str,
-            key: str,
-            secret: str,
-            proxy_host: str,
-            proxy_port: int,
-            margin_mode: str
+        self,
+        key: str,
+        secret: str,
+        proxy_host: str,
+        proxy_port: int
     ) -> None:
         """"""
-        self.margin_mode = margin_mode
-
         super().connect(
-            url,
             key,
             secret,
+            WEBSOCKET_TRADE_HOST,
             proxy_host,
             proxy_port
         )
@@ -921,17 +861,11 @@ class HuobilTradeWebsocketApi(HuobilWebsocketApiBase):
     def subscribe(self) -> int:
         """"""
         self.req_id += 1
-        if self.margin_mode == "cross":
-            topic = "orders_cross.*"
-        else:
-            topic = "orders.*"
-
         req = {
             "op": "sub",
             "cid": str(self.req_id),
-            "topic": topic
+            "topic": "orders_cross.*"
         }
-
         self.send_packet(req)
 
     def on_connected(self) -> None:
@@ -939,11 +873,7 @@ class HuobilTradeWebsocketApi(HuobilWebsocketApiBase):
         self.gateway.write_log("交易Websocket API连接成功")
         self.login()
 
-    def on_disconnected(self):
-        self.gateway.write_log("交易Websocket API断开")
-        super().on_disconnected()
-
-    def on_login(self, packet) -> None:
+    def on_login(self) -> None:
         """"""
         self.gateway.write_log("交易Websocket API登录成功")
         self.subscribe()
@@ -1017,7 +947,6 @@ class HuobilDataWebsocketApi(HuobilWebsocketApiBase):
 
     def connect(
             self,
-            url: str,
             key: str,
             secret: str,
             proxy_host: str,
@@ -1025,9 +954,9 @@ class HuobilDataWebsocketApi(HuobilWebsocketApiBase):
     ) -> None:
         """"""
         super().connect(
-            url,
             key,
             secret,
+            WEBSOCKET_DATA_HOST,
             proxy_host,
             proxy_port
         )
@@ -1038,10 +967,6 @@ class HuobilDataWebsocketApi(HuobilWebsocketApiBase):
 
         for ws_symbol in self.ticks.keys():
             self.subscribe_data(ws_symbol)
-
-    def on_disconnected(self):
-        self.gateway.write_log("行情Websocket API断开")
-        super().on_disconnected()
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """"""
@@ -1100,7 +1025,6 @@ class HuobilDataWebsocketApi(HuobilWebsocketApiBase):
         tick.datetime = generate_datetime(data["ts"] / 1000)
 
         tick_data = data["tick"]
-        tick.tick_id = str(tick_data["id"])
         if "bids" not in tick_data or "asks" not in tick_data:
             return
 

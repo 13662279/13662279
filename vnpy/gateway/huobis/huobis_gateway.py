@@ -1,7 +1,3 @@
-"""
-火币合约接口
-"""
-
 import re
 import urllib
 import base64
@@ -13,9 +9,8 @@ import sys
 from copy import copy
 from datetime import datetime, timedelta
 from threading import Lock
-from typing import Sequence
 import pytz
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Sequence
 from time import sleep
 
 from vnpy.event import Event
@@ -334,8 +329,6 @@ class HuobisRestApi(RestClient):
                 "/swap-ex/market/history/kline",
                 params=params
             )
-
-            print(params)
 
             # Break if request failed with other status code
             if resp.status_code // 100 != 2:
@@ -870,7 +863,7 @@ class HuobisTradeWebsocketApi(HuobisWebsocketApiBase):
         req = {
             "op": "sub",
             "cid": str(self.req_id),
-            "topic": f"orders.*"
+            "topic": "orders.*"
         }
         self.send_packet(req)
 
